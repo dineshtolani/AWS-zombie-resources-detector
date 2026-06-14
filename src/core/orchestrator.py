@@ -1,3 +1,4 @@
+from datetime import datetime, timedelta
 from src.collectors.cloudwatch import CloudWatchCollector
 from src.collectors.prometheus import PrometheusCollector
 from src.detectors.zombie_detector import detect_per_type, analyze_by_source, print_detection_summary
@@ -22,14 +23,19 @@ class AcheronOrchestrator:
         self.prom_collector = PrometheusCollector()
         self.reports_dir = reports_dir
 
-    def run_week(self, week_number=None, cw_count=120, prom_count=80, incident_count=80):
+    def run_week(self, week_number=None, cw_count=120, prom_count=80, incident_count=80, week_start=None, week_end=None):
         if week_number is None:
             week_number = self.store.advance_week()
         else:
             week_number = week_number
 
+        if week_start is None:
+            week_start = datetime.now()
+        if week_end is None:
+            week_end = datetime.now()
+
         print(f"\n{'#'*60}")
-        print(f"  ACHERON WEEKLY SCAN — Week #{week_number}")
+        print(f"  ACHERON WEEKLY SCAN — Week #{week_number} ({week_start.strftime('%b %d')} - {week_end.strftime('%b %d, %Y')})")
         print(f"{'#'*60}")
 
         # Step 1: Collect data (fixed resource pool, metrics vary by week)
@@ -69,6 +75,8 @@ class AcheronOrchestrator:
             results=results,
             by_source=by_source,
             output_dir=self.reports_dir,
+            week_start=week_start,
+            week_end=week_end,
         )
 
         print(f"\n{'#'*60}")
@@ -92,9 +100,16 @@ class AcheronOrchestrator:
 
         self.store.reset()
         results = []
+        base_date = datetime.now()
         for w in range(1, num_weeks + 1):
             self.store.advance_week()
-            r = self.run_week(week_number=w, cw_count=cw_count, prom_count=prom_count, incident_count=incident_count)
+            week_start = base_date - timedelta(weeks=num_weeks - w + 1)
+            week_end = base_date - timedelta(weeks=num_weeks - w)
+            r = self.run_week(
+                week_number=w, cw_count=cw_count, prom_count=prom_count,
+                incident_count=incident_count,
+                week_start=week_start, week_end=week_end,
+            )
             results.append(r)
 
         print(f"\n{'='*60}")

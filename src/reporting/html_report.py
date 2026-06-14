@@ -2,7 +2,7 @@ import os
 from datetime import datetime
 
 
-def generate_html_report(week_number, findings_summary, findings, incident_data, results, by_source, output_dir="reports"):
+def generate_html_report(week_number, findings_summary, findings, incident_data, results, by_source, output_dir="reports", week_start=None, week_end=None):
     os.makedirs(output_dir, exist_ok=True)
 
     zombies = sorted([r for r in results if r.get("is_zombie")], key=lambda x: x["anomaly_score"], reverse=True)
@@ -46,6 +46,12 @@ def generate_html_report(week_number, findings_summary, findings, incident_data,
     aws_s = by_source.get("aws", {}).get("savings", 0)
     k8s_s = by_source.get("k8s", {}).get("savings", 0)
 
+    if not week_start:
+        week_start = datetime.now()
+    if not week_end:
+        week_end = datetime.now()
+    week_start_str = week_start.strftime("%b %d, %Y")
+    week_end_str = week_end.strftime("%b %d, %Y")
     now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S UTC")
 
     report = f"""<!DOCTYPE html>
@@ -101,7 +107,8 @@ code {{ font-family:'JetBrains Mono','Fira Code',monospace; font-size:0.78rem; }
 <h1>Project Acheron</h1>
 <p>AWS + Kubernetes Resource Intelligence &bull; Weekly Executive Report</p>
 <div class="week-badge">Week #{week_number}</div>
-<p style="margin-top:8px; color:#64748b; font-size:0.8rem;">{now_str}</p>
+<p style="margin-top:6px; color:#94a3b8; font-size:0.85rem;">{week_start_str} — {week_end_str}</p>
+<p style="margin-top:4px; color:#64748b; font-size:0.8rem;">Generated: {now_str}</p>
 </div>
 <div class="container">
 
