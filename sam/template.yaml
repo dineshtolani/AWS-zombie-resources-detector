@@ -1,0 +1,347 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: "Project Acheron — AWS + K8s Resource Intelligence Platform"
+
+Parameters:
+  FromEmail:
+    Type: String
+    Description: Verified SES sender email
+    Default: acheron@example.com
+  ReportRecipients:
+    Type: CommaDelimitedList
+    Description: SES recipients for weekly reports
+    Default: "ops@example.com"
+  ContaminationRate:
+    Type: Number
+    Description: Isolation Forest contamination hyperparameter
+    Default: 0.20
+  LogGroups:
+    Type: CommaDelimitedList
+    Description: CloudWatch Log Groups for incident scanning
+    Default: "/aws/lambda/*"
+  EksClusterNames:
+    Type: CommaDelimitedList
+    Description: EKS clusters to scan
+    Default: ""
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Timeout: 300
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        POWERTOOLS_SERVICE_NAME: acheron
+        POWERTOOLS_METRICS_NAMESPACE: Acheron
+
+Resources:
+
+  # ============================================================
+  # DynamoDB Tables
+  # ============================================================
+
+  FindingsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: acheron-findings
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: resource_id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: resource_id
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  IncidentsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: acheron-incidents
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: signature
+          AttributeType: S
+      KeySchema:
+        - AttributeName: signature
+          KeyType: HASH
+      SSESpecification:
+        SSEEnabled: true
+
+  # ============================================================
+  # S3 Buckets
+  # ============================================================
+
+  ModelBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "acheron-models-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-old-models
+            Status: Enabled
+            NoncurrentVersionExpirationInDays: 90
+
+  ReportBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub "acheron-reports-${AWS::AccountId}-${AWS::Region}"
+      VersioningConfiguration:
+        Status: Enabled
+      LifecycleConfiguration:
+        Rules:
+          - Id: archive-reports
+            Status: Enabled
+            ExpirationInDays: 365
+
+  # ============================================================
+  # Lambda Functions
+  # ============================================================
+
+  # --- Shared Layer (scikit-learn + joblib) ---
+  SklearnLayer:
+    Type: AWS::Serverless::LayerVersion
+    Properties:
+      LayerName: acheron-sklearn
+      Description: scikit-learn and joblib for detector engine
+      ContentUri: layers/sklearn/
+      CompatibleRuntimes:
+        - python3.12
+      RetentionPolicy: Retain
+
+  ResourceDiscovery:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: acheron-resource-discovery
+      CodeUri: lambdas/resource_discovery/
+      Handler: handler.handler
+      Timeout: 300
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeInstances
+                - ec2:DescribeVolumes
+                - ec2:DescribeNatGateways
+                - ec2:DescribeAddresses
+                - rds:DescribeDBInstances
+                - rds:ListTagsForResource
+                - elasticloadbalancing:DescribeLoadBalancers
+                - elasticloadbalancing:DescribeTags
+                - efs:DescribeFileSystems
+                - efs:DescribeTags
+                - eks:DescribeCluster
+                - eks:ListNodegroups
+                - eks:DescribeNodegroup
+              Resource: "*"
+
+  CollectorCloudWatch:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: acheron-collector-cloudwatch
+      CodeUri: lambdas/collector_cloudwatch/
+      Handler: handler.handler
+      Policies:
+        - CloudWatchReadOnlyAccess: {}
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - ec2:DescribeVolumes
+                - ec2:DescribeInstances
+                - rds:DescribeDBInstances
+                - elasticloadbalancing:DescribeLoadBalancers
+                - eks:DescribeNodegroup
+                - eks:ListNodegroups
+              Resource: "*"
+
+  CollectorPrometheus:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: acheron-collector-prometheus
+      CodeUri: lambdas/collector_prometheus/
+      Handler: handler.handler
+      Policies:
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action:
+                - aps:QueryMetrics
+                - eks:DescribeCluster
+                - eks:DescribeNodegroup
+                - eks:ListNodegroups
+              Resource: "*"
+        - CloudWatchReadOnlyAccess: {}
+
+  IncidentIngestion:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: acheron-incident-ingestion
+      CodeUri: lambdas/incident_ingestion/
+      Handler: handler.handler
+      Policies:
+        - CloudWatchReadOnlyAccess: {}
+
+  DetectorEngine:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: acheron-detector-engine
+      CodeUri: lambdas/detector_engine/
+      Handler: handler.handler
+      MemorySize: 1024
+      Timeout: 900
+      Layers:
+        - !Ref SklearnLayer
+      Environment:
+        Variables:
+          MODEL_BUCKET: !Ref ModelBucket
+          CONTAMINATION: !Ref ContaminationRate
+      Policies:
+        - S3CrudPolicy:
+            Bucket: !Ref ModelBucket
+
+  StateMerge:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: acheron-state-merge
+      CodeUri: lambdas/state_merge/
+      Handler: handler.handler
+      Environment:
+        Variables:
+          FINDINGS_TABLE: !Ref FindingsTable
+          INCIDENTS_TABLE: !Ref IncidentsTable
+          CHRONIC_THRESHOLD: "6"
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref FindingsTable
+        - DynamoDBCrudPolicy:
+            TableName: !Ref IncidentsTable
+
+  ReportGenerator:
+    Type: AWS::Serverless::Function
+    Properties:
+      FunctionName: acheron-report-generator
+      CodeUri: lambdas/report_generator/
+      Handler: handler.handler
+      Environment:
+        Variables:
+          REPORT_BUCKET: !Ref ReportBucket
+          FROM_EMAIL: !Ref FromEmail
+      Policies:
+        - S3CrudPolicy:
+            Bucket: !Ref ReportBucket
+        - Version: "2012-10-17"
+          Statement:
+            - Effect: Allow
+              Action: ses:SendRawEmail
+              Resource: "*"
+
+  # ============================================================
+  # Step Functions State Machine
+  # ============================================================
+
+  AcheronStateMachine:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Name: acheron-weekly-scan
+      DefinitionUri: sam/state_machine.asl.json
+      DefinitionSubstitutions:
+        ResourceDiscoveryArn: !GetAtt ResourceDiscovery.Arn
+        CollectorCloudWatchArn: !GetAtt CollectorCloudWatch.Arn
+        CollectorPrometheusArn: !GetAtt CollectorPrometheus.Arn
+        IncidentIngestionArn: !GetAtt IncidentIngestion.Arn
+        DetectorEngineArn: !GetAtt DetectorEngine.Arn
+        StateMergeArn: !GetAtt StateMerge.Arn
+        ReportGeneratorArn: !GetAtt ReportGenerator.Arn
+        ReportRecipients: !Join [",", !Ref ReportRecipients]
+        LogGroups: !Join [",", !Ref LogGroups]
+        EksClusters: !Join [",", !Ref EksClusterNames]
+      Role: !GetAtt StateMachineRole.Arn
+      Tracing:
+        Enabled: true
+
+  StateMachineRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: states.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: acheron-sm-invoke
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource:
+                  - !GetAtt ResourceDiscovery.Arn
+                  - !GetAtt CollectorCloudWatch.Arn
+                  - !GetAtt CollectorPrometheus.Arn
+                  - !GetAtt IncidentIngestion.Arn
+                  - !GetAtt DetectorEngine.Arn
+                  - !GetAtt StateMerge.Arn
+                  - !GetAtt ReportGenerator.Arn
+              - Effect: Allow
+                Action:
+                  - events:PutTargets
+                  - events:PutRule
+                  - events:DescribeRule
+                Resource: "*"
+
+  # ============================================================
+  # EventBridge Weekly Schedule
+  # ============================================================
+
+  WeeklySchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: acheron-weekly-trigger
+      Description: Triggers Acheron weekly scan every Monday at 09:00 UTC
+      ScheduleExpression: "cron(0 9 ? * MON *)"
+      State: ENABLED
+      Targets:
+        - Arn: !Ref AcheronStateMachine
+          Id: AcheronSM
+          RoleArn: !GetAtt EventBridgeRole.Arn
+          Input: '{"trigger": "scheduled", "week_offset": 0}'
+
+  EventBridgeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: acheron-eb-invoke-sm
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref AcheronStateMachine
+
+Outputs:
+  StateMachineArn:
+    Description: Step Functions state machine ARN
+    Value: !Ref AcheronStateMachine
+  FindingsTableName:
+    Description: DynamoDB table for findings
+    Value: !Ref FindingsTable
+  ReportBucketName:
+    Description: S3 bucket for reports
+    Value: !Ref ReportBucket
+  ModelBucketName:
+    Description: S3 bucket for ML models
+    Value: !Ref ModelBucket

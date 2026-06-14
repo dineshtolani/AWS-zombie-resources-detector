@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+.env
+.venv
+venv/
+*.egg-info/
+dist/
+build/
+
+# Simulation state (regenerated on each run)
+data/*.json
+
+# HTML reports (regenerated on each run)
+reports/*.html
+
+# SAM build artifacts
+.aws-sam/
+
+# OS files
+.DS_Store
+Thumbs.db

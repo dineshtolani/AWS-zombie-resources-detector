@@ -1,0 +1,205 @@
+{
+  "Comment": "Project Acheron — Weekly Resource Intelligence Scan",
+  "StartAt": "DiscoverResources",
+  "States": {
+    "DiscoverResources": {
+      "Type": "Task",
+      "Comment": "Step 0: Discover all resources via AWS APIs",
+      "Resource": "${ResourceDiscoveryArn}",
+      "Parameters": {
+        "regions": ["us-east-1"],
+        "eks_clusters.$": "$.eks_clusters",
+        "week_number.$": "$.week_number"
+      },
+      "ResultPath": "$.discovery",
+      "Next": "PrepareCollection"
+    },
+
+    "PrepareCollection": {
+      "Type": "Pass",
+      "Comment": "Pass discovery results into collection step",
+      "Parameters": {
+        "ec2_ids.$": "$.discovery.id_lists.ec2_ids",
+        "ebs_ids.$": "$.discovery.id_lists.ebs_ids",
+        "rds_ids.$": "$.discovery.id_lists.rds_ids",
+        "nat_ids.$": "$.discovery.id_lists.nat_ids",
+        "alb_ids.$": "$.discovery.id_lists.alb_ids",
+        "efs_ids.$": "$.discovery.id_lists.efs_ids",
+        "eip_ids.$": "$.discovery.id_lists.eip_ids",
+        "eks_cluster.$": "$.discovery.id_lists.eks_cluster_ids",
+        "eks_nodegroup_ids.$": "$.discovery.id_lists.eks_nodegroup_ids",
+        "resources.$": "$.discovery.resources",
+        "incidents.$": "$.incidents",
+        "week_number.$": "$.week_number",
+        "recipients.$": "$.recipients",
+        "log_groups.$": "$.log_groups"
+      },
+      "Next": "CollectMetrics"
+    },
+
+    "CollectMetrics": {
+      "Type": "Parallel",
+      "Comment": "Step 1: Collect metrics from all sources in parallel",
+      "Branches": [
+        {
+          "StartAt": "CollectEC2",
+          "States": {
+            "CollectEC2": {
+              "Type": "Task",
+              "Resource": "${CollectorCloudWatchArn}",
+              "Parameters": {
+                "resource_type": "ec2",
+                "resource_ids.$": "$.ec2_ids",
+                "hours_back": 168
+              },
+              "ResultPath": "$.aws.ec2",
+              "Next": "CollectEBS"
+            },
+            "CollectEBS": {
+              "Type": "Task",
+              "Resource": "${CollectorCloudWatchArn}",
+              "Parameters": {
+                "resource_type": "ebs",
+                "resource_ids.$": "$.ebs_ids",
+                "hours_back": 168
+              },
+              "ResultPath": "$.aws.ebs",
+              "Next": "CollectRDS"
+            },
+            "CollectRDS": {
+              "Type": "Task",
+              "Resource": "${CollectorCloudWatchArn}",
+              "Parameters": {
+                "resource_type": "rds",
+                "resource_ids.$": "$.rds_ids",
+                "hours_back": 168
+              },
+              "ResultPath": "$.aws.rds",
+              "Next": "CollectNAT"
+            },
+            "CollectNAT": {
+              "Type": "Task",
+              "Resource": "${CollectorCloudWatchArn}",
+              "Parameters": {
+                "resource_type": "nat",
+                "resource_ids.$": "$.nat_ids",
+                "hours_back": 168
+              },
+              "ResultPath": "$.aws.nat",
+              "Next": "CollectALB"
+            },
+            "CollectALB": {
+              "Type": "Task",
+              "Resource": "${CollectorCloudWatchArn}",
+              "Parameters": {
+                "resource_type": "alb",
+                "resource_ids.$": "$.alb_ids",
+                "hours_back": 168
+              },
+              "ResultPath": "$.aws.alb",
+              "Next": "CollectEFS"
+            },
+            "CollectEFS": {
+              "Type": "Task",
+              "Resource": "${CollectorCloudWatchArn}",
+              "Parameters": {
+                "resource_type": "efs",
+                "resource_ids.$": "$.efs_ids",
+                "hours_back": 168
+              },
+              "ResultPath": "$.aws.efs",
+              "Next": "CollectEIP"
+            },
+            "CollectEIP": {
+              "Type": "Task",
+              "Resource": "${CollectorCloudWatchArn}",
+              "Parameters": {
+                "resource_type": "eip",
+                "resource_ids.$": "$.eip_ids",
+                "hours_back": 168
+              },
+              "ResultPath": "$.aws.eip",
+              "Next": "CollectEKS"
+            },
+            "CollectEKS": {
+              "Type": "Task",
+              "Resource": "${CollectorPrometheusArn}",
+              "Parameters": {
+                "cluster_name.$": "$.eks_cluster",
+                "source": "container_insights"
+              },
+              "ResultPath": "$.aws.eks",
+              "End": true
+            }
+          }
+        },
+        {
+          "StartAt": "CollectIncidents",
+          "States": {
+            "CollectIncidents": {
+              "Type": "Task",
+              "Resource": "${IncidentIngestionArn}",
+              "Parameters": {
+                "log_groups.$": "$.log_groups",
+                "hours_back": 168
+              },
+              "ResultPath": "$.incidents",
+              "End": true
+            }
+          }
+        }
+      ],
+      "Next": "MergeResourceLists"
+    },
+
+    "MergeResourceLists": {
+      "Type": "Pass",
+      "Comment": "Flatten collected resources into a single list for the detector",
+      "Parameters": {
+        "all_resources.$": "States.Array($.aws.ec2.resources[], $.aws.ebs.resources[], $.aws.rds.resources[], $.aws.nat.resources[], $.aws.alb.resources[], $.aws.efs.resources[], $.aws.eip.resources[], $.aws.eks.resources[])",
+        "incidents.$": "$.incidents.incidents",
+        "week_number.$": "$.week_number"
+      },
+      "Next": "DetectZombies"
+    },
+
+    "DetectZombies": {
+      "Type": "Task",
+      "Comment": "Step 2: Run per-type Isolation Forest detection",
+      "Resource": "${DetectorEngineArn}",
+      "Parameters": {
+        "resources.$": "$.all_resources"
+      },
+      "ResultPath": "$.detection",
+      "Next": "MergeState"
+    },
+
+    "MergeState": {
+      "Type": "Task",
+      "Comment": "Step 3: Persist findings to DynamoDB with recurrence tracking",
+      "Resource": "${StateMergeArn}",
+      "Parameters": {
+        "results.$": "$.detection.results",
+        "week_number.$": "$.week_number"
+      },
+      "ResultPath": "$.findings",
+      "Next": "GenerateReport"
+    },
+
+    "GenerateReport": {
+      "Type": "Task",
+      "Comment": "Step 4: Generate HTML report and send via SES",
+      "Resource": "${ReportGeneratorArn}",
+      "Parameters": {
+        "week_number.$": "$.week_number",
+        "findings_summary.$": "$.findings.summary",
+        "findings.$": "$.findings.findings",
+        "incidents.$": "$.incidents",
+        "results.$": "$.detection.results",
+        "recipients.$": "$.recipients"
+      },
+      "ResultPath": "$.report",
+      "End": true
+    }
+  }
+}
